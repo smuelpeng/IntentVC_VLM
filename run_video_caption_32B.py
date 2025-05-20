@@ -284,7 +284,7 @@ def generate_caption_for_segment(model, processor, video_path, bbox_path, max_ne
             print(f"FPS: {actual_fps}")
             
         # Calculate frame indices for uniform sampling of 10 frames for captioning
-        frame_indices = np.linspace(0, total_frames-1, 5, dtype=int)
+        frame_indices = np.linspace(0, total_frames-1, 10, dtype=int)
         frames = vr.get_batch(frame_indices).asnumpy()
         
         # Create debug directory for saving frames
@@ -307,47 +307,34 @@ def generate_caption_for_segment(model, processor, video_path, bbox_path, max_ne
                 x, y, w, h = adjust_bbox_for_resize((x, y, w, h), original_size, new_size)
                 # focus处理
                 focus_img = apply_focus_effect(np.array(pil_image), (x, y, w, h))
-                focus_img = Image.fromarray(focus_img)
-
-                # Draw bounding box on the image                
-                draw = ImageDraw.Draw(pil_image)
-                draw.rectangle([x, y, x + w, y + h], outline="red", width=1)
-
-                draw = ImageDraw.Draw(focus_img)
-                draw.rectangle([x, y, x + w, y + h], outline="red", width=1)
+                pil_image = Image.fromarray(focus_img)
+                
+                # Draw bounding box on the image
+                
+                # draw = ImageDraw.Draw(pil_image)
+                # draw.rectangle([x, y, x + w, y + h], outline="red", width=2)
                 
                 # Save the frame with bounding box
                 frame_path = os.path.join(debug_dir, f'frame_{original_frame_idx:04d}.jpg')
                 pil_image.save(frame_path)
-                focus_frame_path = os.path.join(debug_dir, f'frame_{original_frame_idx}_focus.jpg')
-                focus_img.save(focus_frame_path)
             else:
-                focus_img = pil_image
                 print(f"Warning: No bounding box found for frame {original_frame_idx}")
-            
             
             buffer = BytesIO()
             pil_image.save(buffer, format="JPEG")
             img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
-
-            buffer_focus = BytesIO()
-            focus_img.save(buffer_focus, format="JPEG")
-            img_str_focus = base64.b64encode(buffer_focus.getvalue()).decode('utf-8')
-
             frame_list.append(f"data:image/jpeg;base64,{img_str}")
-            frame_list.append(f"data:image/jpeg;base64,{img_str_focus}")
 
         # Prepare bbox information for the prompt
         messages = [
             {
                 "role": "system",
                 "content":
-                    f"You are a professional video captioning model, specialized in generating objective and concise descriptions for short video clips. "
-                    f"Your sole task is to describe **only the object** inside the red bounding box across the video frames. "
-                    f"The object in the bounding box is a {object_category}. "
-                    f"Ignore any visual elements or actions that are outside the bounding box. "
-                    f"Your caption must be a single, third-person, present-tense declarative sentence. "
-                    f"Avoid speculation, subjective language, or information not visually supported by the red box."
+                    "You are a professional video captioning model, specialized in generating objective and concise descriptions for short video clips. "
+                    "Your sole task is to describe **only the object** inside the red bounding box across the video frames. "
+                    "Ignore any visual elements or actions that are outside the bounding box. "
+                    "Your caption must be a single, third-person, present-tense declarative sentence. "
+                    "Avoid speculation, subjective language, or information not visually supported by the red box."
             },
             {
                 "role": "user",
@@ -439,13 +426,15 @@ def split_list(lst, n):
 
 
 def process_videos_on_gpu(process_args, args):
-    """Process a batch of videos on a single GPU."""
-    gpu_id, video_triples = process_args
-    torch.cuda.set_device(gpu_id)
+    """Process a batch of videos using 4 GPUs."""
+    gpu_ids, video_triples = process_args
+    # Set the first GPU as the main device
+    torch.cuda.set_device(gpu_ids[0])
     
     model_kwargs = {
         "torch_dtype": torch.bfloat16,
-        "device_map": f"cuda:{gpu_id}"
+        "device_map": "auto",  # Let the model handle device mapping
+        # "max_memory": {f"cuda:{i}": "10GiB" for i in gpu_ids}  # Limit memory per GPU
     }
     if args.use_flash_attn:
         model_kwargs["attn_implementation"] = "flash_attention_2"
@@ -463,7 +452,7 @@ def process_videos_on_gpu(process_args, args):
     temp_file = os.path.join(args.output_dir, "temp_captions.jsonl")
     
     results = {}
-    for video_id, video_path, bbox_path in tqdm(video_triples, desc=f"GPU {gpu_id}", position=gpu_id):
+    for video_id, video_path, bbox_path in tqdm(video_triples, desc=f"GPUs {gpu_ids}", position=0):
         # try:
         if True:
             # Get the prompt and caption
@@ -502,7 +491,7 @@ def process_videos_on_gpu(process_args, args):
                 results[video_id] = ''
                 
         # except Exception as e:
-        #     print(f"\nError processing video {video_path} on GPU {gpu_id}: {str(e)}")
+        #     print(f"\nError processing video {video_path} on GPUs {gpu_ids}: {str(e)}")
         #     results[video_id] = ''
     
     del model
@@ -534,18 +523,25 @@ def main():
         if not video_paths:
             continue
             
-        # Remove random shuffle to maintain order
-        num_gpus = min(args.num_gpus, torch.cuda.device_count())
-        if num_gpus < 1:
-            print("Error: No GPUs available")
+        # Calculate number of GPU groups (4 GPUs per group)
+        total_gpus = torch.cuda.device_count()
+        if total_gpus < 4:
+            print("Error: Need at least 4 GPUs available")
             return
+            
+        num_gpu_groups = total_gpus // 4
+        num_gpus = min(args.num_gpus // 4, num_gpu_groups)  # Convert to number of 4-GPU groups
         
+        # Split videos into groups for each 4-GPU group
         video_groups = split_list(video_paths, num_gpus)
-        process_args = [(i, group) for i, group in enumerate(video_groups)]
+        
+        # Create GPU groups (each group has 4 GPUs)
+        gpu_groups = [list(range(i*4, (i+1)*4)) for i in range(num_gpus)]
+        process_args = [(gpu_group, video_group) for gpu_group, video_group in zip(gpu_groups, video_groups)]
         
         mp.set_start_method('spawn', force=True)
         
-        print(f"Starting video processing on {num_gpus} GPUs for {output_name}...")
+        print(f"Starting video processing on {num_gpus} GPU groups (4 GPUs each) for {output_name}...")
         with Pool(num_gpus) as pool:
             all_results_groups = pool.map(partial(process_videos_on_gpu, args=args), process_args)
         
